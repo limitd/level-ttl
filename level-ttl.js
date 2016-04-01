@@ -23,23 +23,48 @@ function buildQuery (db) {
 }
 
 function startTtl (db, checkFrequency) {
+  const sub = db._ttl.sub
+  var createReadStream, runBatch
+
+  if (sub) {
+    createReadStream = sub.createReadStream.bind(sub)
+
+    runBatch = function (subBatch, batch, callback) {
+      const done = after(2, callback)
+      sub.batch(
+          subBatch
+        , { keyEncoding: 'binary' }
+        , done
+      )
+
+      db._ttl.batch(
+          batch
+        , { keyEncoding: 'binary' }
+        , done
+      )
+    }
+  } else{
+    createReadStream = db.createReadStream.bind(db)
+    runBatch = function (subBatch, batch, callback) {
+      db._ttl.batch(
+          subBatch.concat(batch)
+        , { keyEncoding: 'binary' }
+        , callback
+      )
+    }
+  }
+
   db._ttl.intervalId = setInterval(function () {
-    const batch    = []
-        , subBatch = []
-        , sub      = db._ttl.sub
-        , query    = buildQuery(db)
+    const query    = buildQuery(db)
         , decode   = db._ttl.encoding.decode
-    var createReadStream
 
     db._ttl._checkInProgress = true
 
-    if (sub)
-      createReadStream = sub.createReadStream.bind(sub)
-    else
-      createReadStream = db.createReadStream.bind(db)
-
     createReadStream(query)
       .on('data', function (data) {
+        const batch    = []
+            , subBatch = []
+
         // the value is the key!
         const key = decode(data.value)
         // expiryKey that matches this query
@@ -47,43 +72,18 @@ function startTtl (db, checkFrequency) {
         subBatch.push({ type: 'del', key: prefixKey(db, key) })
         // the actual data that should expire now!
         batch.push({ type: 'del', key: key })
+
+        //We want to expire this right now
+        //without waiting the stream is fully read
+        //and we want to lock on TTL changes on this key
+        db._ttl._lock(key, function (release) {
+          runBatch(subBatch, batch, release(function (err) {
+            if (err)
+              db.emit('error', err)
+          }));
+        })
       })
       .on('error', db.emit.bind(db, 'error'))
-      .on('end', function () {
-        if (!batch.length)
-          return
-
-        if (sub) {
-          sub.batch(
-              subBatch
-            , { keyEncoding: 'binary' }
-            , function (err) {
-                if (err)
-                  db.emit('error', err)
-              }
-          )
-
-          db._ttl.batch(
-              batch
-            , { keyEncoding: 'binary' }
-            , function (err) {
-                if (err)
-                  db.emit('error', err)
-              }
-          )
-        }
-        else {
-          db._ttl.batch(
-              subBatch.concat(batch)
-            , { keyEncoding: 'binary' }
-            , function (err) {
-                if (err)
-                  db.emit('error', err)
-              }
-          )
-        }
-
-      })
       .on('close', function () {
         db._ttl._checkInProgress = false
         if (db._ttl._stopAfterCheck) {
